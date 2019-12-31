@@ -2,9 +2,9 @@ use std::cell::Cell;
 use std::io;
 use std::iter;
 use std::ptr;
-use std::sync::atomic::{self, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, Thread};
 use std::time::Duration;
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
@@ -51,6 +51,12 @@ pub struct Runtime {
 
     /// The scheduler state.
     sched: Mutex<Scheduler>,
+
+    /// The thread ID of the runtime.
+    // Why a spinlock? There's only one place we set this (the `run()` preamble),
+    // and one place we used this (the `notify()` function), so we really don't
+    // get that much contention.
+    thread: Spinlock<Thread>,
 }
 
 impl Runtime {
@@ -63,6 +69,7 @@ impl Runtime {
         Runtime {
             reactor: Reactor::new().unwrap(),
             injector: Injector::new(),
+            thread: Spinlock::new(thread::current()),
             stealers,
             sched: Mutex::new(Scheduler {
                 processors,
@@ -101,13 +108,16 @@ impl Runtime {
     /// Runs the runtime on the current thread.
     pub fn run(&self) {
         scope(|s| {
-            let mut idle = 0;
+            const DELAY_MIN: u64 = 1_250;
+            const DELAY_MAX: u64 = 10_000;
             let mut delay = 0;
+
+            *self.thread.lock() = thread::current();
 
             loop {
                 // Get a list of new machines to start, if any need to be started.
                 for m in self.make_machines() {
-                    idle = 0;
+                    delay = DELAY_MIN;
 
                     s.builder()
                         .name("async-std/machine".to_string())
@@ -121,14 +131,46 @@ impl Runtime {
                 }
 
                 // Sleep for a bit longer if the scheduler state hasn't changed in a while.
-                if idle > 10 {
-                    delay = (delay * 2).min(10_000);
-                } else {
-                    idle += 1;
-                    delay = 1000;
-                }
+                delay = (delay * 2).min(DELAY_MAX);
 
                 thread::sleep(Duration::from_micros(delay));
+
+                // If no new work has been scheduled since the last this process ran a tick,
+                // then the whole system is sleeping. In the interest of saving battery, sleep indefinitely.
+                //
+                // # Soundness
+                //
+                // The goal of this design is to ensure that blocked machines do not cause tasks to starve.
+                //
+                // This parker is unparked at the same time as the progress flag is set. This should be sound,
+                // because if the system goes from setting the flag to not setting it, we detect that.
+                // We also need to unpark whenever a notification comes in, so that if there is no machine polling the reactor,
+                // we can get around to spawning a new machine.
+                //
+                // * If work is added to the backlog while we're parked and the is no machine polling, we gets unparked,
+                //   spin for 10_000 + 5_000 + 2_500 + 1_250 = 18_750 (~20K) microseconds, and will spawn a
+                //   machine because all the existing machines are blocked while doing so, then we park again.
+                // * If work is added before we park and everybody is blocked, then the token will be set as described
+                //   in crossbeam's docs, and we'll finish the old iteration, then claim the token, then go through
+                //   scenario 1 again. The old ramp-up, plus the new ramp-up, adds up to ~40_000 microseconds before we sleep.
+                // * If work is added to the blacklog while a machine is still healthy, but then the machine turns
+                //   to blocking afterward, then at the last point in which the machine claimed a job, it would have
+                //   unparked us, and we'll spin enough times to detect the change.
+                //
+                // The largest possible sleep-induced delay is adding a task between the 10ms and 5ms spots, making a 15ms delay.
+                // This design also means that, as long as we either get a notification or complete a job every 20ms,
+                // this design will only perform atomics ops, no locking.
+                //
+                // This assumes, of course, that we go through a sufficient number of iterations before parking,
+                // where "sufficient" means "if it doesn't pop anything off the queue while we ramp, we mark it unhealthy."
+                // Since it currently uses a bool, that means our ramp-up must be at least three iterations long:
+                // once for the still-healthy machine to set it to true, once for us to set it to false, and once for us to
+                // verify that it's still false.
+                assert!(DELAY_MAX / DELAY_MIN > 2);
+                if delay == DELAY_MAX {
+                    thread::park();
+                    delay = DELAY_MIN;
+                }
             }
         })
         .unwrap();
@@ -139,6 +181,8 @@ impl Runtime {
         let mut sched = self.sched.lock().unwrap();
         let mut to_start = Vec::new();
 
+        let thread = thread::current();
+
         // If there is a machine that is stuck on a task and not making any progress, steal its
         // processor and set up a new machine to take over.
         for m in &mut sched.machines {
@@ -146,7 +190,7 @@ impl Runtime {
                 let opt_p = m.processor.try_lock().and_then(|mut p| p.take());
 
                 if let Some(p) = opt_p {
-                    *m = Arc::new(Machine::new(p));
+                    *m = Arc::new(Machine::new(p, thread.clone()));
                     to_start.push(m.clone());
                 }
             }
@@ -157,7 +201,7 @@ impl Runtime {
         if !sched.polling {
             if !sched.progress {
                 if let Some(p) = sched.processors.pop() {
-                    let m = Arc::new(Machine::new(p));
+                    let m = Arc::new(Machine::new(p, thread.clone()));
                     to_start.push(m.clone());
                     sched.machines.push(m);
                 }
@@ -171,7 +215,11 @@ impl Runtime {
 
     /// Unparks a thread polling the reactor.
     fn notify(&self) {
-        atomic::fence(Ordering::SeqCst);
+        // In case there isn't anyone polling the reactor.
+        if let Some(thread) = self.thread.try_lock() {
+            thread.unpark();
+        }
+        // In case there is someone polling the reactor.
         self.reactor.notify().unwrap();
     }
 
@@ -198,14 +246,18 @@ struct Machine {
 
     /// Gets set to `true` before running every task to indicate the machine is not stuck.
     progress: AtomicBool,
+
+    /// The thread handle of the runtime.
+    runtime: Thread,
 }
 
 impl Machine {
     /// Creates a new machine running a processor.
-    fn new(p: Processor) -> Machine {
+    fn new(p: Processor, thread: Thread) -> Machine {
         Machine {
             processor: Spinlock::new(Some(p)),
             progress: AtomicBool::new(true),
+            runtime: thread,
         }
     }
 
@@ -276,6 +328,9 @@ impl Machine {
         loop {
             // let the scheduler know this machine is making progress.
             self.progress.store(true, Ordering::SeqCst);
+            // Notify the runtime to keep track of how long this takes,
+            // in case it blocks.
+            self.runtime.unpark();
 
             // Check if `task::yield_now()` was invoked and flush the slot if so.
             YIELD_NOW.with(|flag| {
